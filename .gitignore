@@ -1,0 +1,32 @@
+# Cargo build artifacts
+/target
+**/*.rs.bk
+
+# Cargo.lock — keep for binaries, ignore for libraries.
+# This is a binary, so we KEEP it. Uncomment the next line for a library.
+# Cargo.lock
+
+# Secrets — never commit a token, even by accident
+.env
+.env.*
+!.env.example
+*.token
+*.secret
+
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS junk
+Thumbs.db
+desktop.ini
+
+# Logs and coredumps
+*.log
+core
+*.core
