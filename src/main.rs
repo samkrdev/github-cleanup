@@ -18,11 +18,12 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
-use crate::app::{App, Mode};
-use crate::github::{GithubClient, Repo};
+use crate::app::{App, Mode, View};
+use crate::github::{Gist, GithubClient, Repo};
 
 enum Msg {
     ReposLoaded(Result<Vec<Repo>>),
+    GistsLoaded(Result<Vec<Gist>>),
     DeleteResult(String, Result<()>),
     DeletionsDone,
 }
@@ -56,11 +57,12 @@ async fn run<B: ratatui::backend::Backend>(
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
-    // Kick off initial repo load
+    // Kick off initial repo + gist load
     spawn_load(client.clone(), tx.clone());
+    spawn_load_gists(client.clone(), tx.clone());
 
     let mut app = App::new(Vec::new());
-    app.status = "loading repositories…".into();
+    app.status = "loading repositories & gists…".into();
 
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
@@ -103,32 +105,49 @@ fn handle_msg(app: &mut App, msg: Msg) {
             let total = repos.len();
             let private = repos.iter().filter(|r| r.private).count();
             app.repos = repos;
-            app.apply_filter();
-            app.cursor = 0;
-            app.status = if private == 0 {
-                format!("loaded {} repos (0 private — token may lack `repo` scope)", total)
-            } else {
-                format!("loaded {} repos ({} private)", total, private)
-            };
+            if app.view == View::Repos {
+                app.apply_filter();
+                app.cursor = 0;
+                app.status = if private == 0 {
+                    format!("loaded {} repos (0 private — token may lack `repo` scope)", total)
+                } else {
+                    format!("loaded {} repos ({} private)", total, private)
+                };
+            }
         }
         Msg::ReposLoaded(Err(e)) => {
-            app.status = format!("load failed: {}", e);
+            app.status = format!("repo load failed: {}", e);
         }
-        Msg::DeleteResult(name, res) => {
+        Msg::GistsLoaded(Ok(gists)) => {
+            let total = gists.len();
+            let public = gists.iter().filter(|g| g.public).count();
+            app.gists = gists;
+            if app.view == View::Gists {
+                app.apply_filter();
+                app.cursor = 0;
+                app.status = format!("loaded {} gists ({} public, {} secret)", total, public, total - public);
+            }
+        }
+        Msg::GistsLoaded(Err(e)) => {
+            app.status = format!("gist load failed: {}", e);
+        }
+        Msg::DeleteResult(key, res) => {
+            let label = app.label_for(&key);
             app.deletion_results
-                .push((name, res.map_err(|e| e.to_string())));
+                .push((key, label, res.map_err(|e| e.to_string())));
         }
         Msg::DeletionsDone => {
             let succeeded: HashSet<String> = app
                 .deletion_results
                 .iter()
-                .filter(|(_, r)| r.is_ok())
-                .map(|(n, _)| n.clone())
+                .filter(|(_, _, r)| r.is_ok())
+                .map(|(k, _, _)| k.clone())
                 .collect();
             let ok = succeeded.len();
             let fail = app.deletion_results.len() - ok;
-            app.remove_repos(&succeeded);
-            app.status = format!("deleted {} · failed {}", ok, fail);
+            let what = app.view.label().to_lowercase();
+            app.remove_selected(&succeeded);
+            app.status = format!("deleted {} {} · failed {}", ok, what, fail);
             app.mode = Mode::Browsing;
             app.deletion_results.clear();
         }
@@ -146,13 +165,13 @@ fn handle_key(
         Mode::Deleting => {} // ignore input during deletion
         Mode::Confirming => match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let names = app.selected_repos();
-                if names.is_empty() {
+                let keys = app.selected_keys();
+                if keys.is_empty() {
                     app.mode = Mode::Browsing;
                 } else {
                     app.mode = Mode::Deleting;
                     app.deletion_results.clear();
-                    spawn_delete(client.clone(), tx.clone(), names);
+                    spawn_delete(client.clone(), tx.clone(), app.view, keys);
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -171,9 +190,14 @@ fn handle_key(
             KeyCode::End | KeyCode::Char('G') => app.jump_bottom(),
             KeyCode::Char(' ') => app.toggle_selected(),
             KeyCode::Char('a') => app.clear_selection(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                app.toggle_view();
+                app.status = format!("viewing {}", app.view.label().to_lowercase());
+            }
             KeyCode::Char('r') => {
                 app.status = "refreshing…".into();
                 spawn_load(client.clone(), tx.clone());
+                spawn_load_gists(client.clone(), tx.clone());
             }
             KeyCode::Char('d') => {
                 if !app.selected.is_empty() {
@@ -220,15 +244,26 @@ fn spawn_load(client: Arc<GithubClient>, tx: mpsc::UnboundedSender<Msg>) {
     });
 }
 
+fn spawn_load_gists(client: Arc<GithubClient>, tx: mpsc::UnboundedSender<Msg>) {
+    tokio::spawn(async move {
+        let res = client.list_gists().await;
+        let _ = tx.send(Msg::GistsLoaded(res));
+    });
+}
+
 fn spawn_delete(
     client: Arc<GithubClient>,
     tx: mpsc::UnboundedSender<Msg>,
-    names: Vec<String>,
+    view: View,
+    keys: Vec<String>,
 ) {
     tokio::spawn(async move {
-        for name in names {
-            let res = client.delete_repo(&name).await;
-            let _ = tx.send(Msg::DeleteResult(name, res));
+        for key in keys {
+            let res = match view {
+                View::Repos => client.delete_repo(&key).await,
+                View::Gists => client.delete_gist(&key).await,
+            };
+            let _ = tx.send(Msg::DeleteResult(key, res));
         }
         let _ = tx.send(Msg::DeletionsDone);
     });
