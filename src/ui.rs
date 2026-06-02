@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, View};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -33,8 +33,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let title = format!(
-        " GitHub Cleanup — {} repos, {} selected ",
-        app.repos.len(),
+        " GitHub Cleanup — {} · {} {}, {} selected ",
+        app.view.label(),
+        app.item_count(),
+        match app.view {
+            View::Repos => "repos",
+            View::Gists => "gists",
+        },
         app.selected.len()
     );
     let filter_line = if app.filter.is_empty() && app.mode != Mode::Filtering {
@@ -63,43 +68,15 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .filtered
         .iter()
-        .map(|&i| {
-            let r = &app.repos[i];
-            let checked = if app.selected.contains(&r.full_name) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            let mut flags = Vec::new();
-            if r.private {
-                flags.push(Span::styled(" priv", Style::default().fg(Color::Red)));
-            }
-            if r.fork {
-                flags.push(Span::styled(" fork", Style::default().fg(Color::Magenta)));
-            }
-            if r.archived {
-                flags.push(Span::styled(" arch", Style::default().fg(Color::DarkGray)));
-            }
-            let mut spans = vec![
-                Span::styled(
-                    checked,
-                    Style::default().fg(if app.selected.contains(&r.full_name) {
-                        Color::Green
-                    } else {
-                        Color::DarkGray
-                    }),
-                ),
-                Span::raw(" "),
-                Span::styled(r.full_name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("  ★{}", r.stargazers_count)),
-            ];
-            spans.extend(flags);
-            ListItem::new(Line::from(spans))
+        .map(|&i| match app.view {
+            View::Repos => repo_item(app, &app.repos[i]),
+            View::Gists => gist_item(app, &app.gists[i]),
         })
         .collect();
 
+    let title = format!(" {} ", app.view.label());
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Repositories "))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
 
@@ -110,13 +87,82 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+fn checkbox(selected: bool) -> Span<'static> {
+    Span::styled(
+        if selected { "[x]" } else { "[ ]" },
+        Style::default().fg(if selected { Color::Green } else { Color::DarkGray }),
+    )
+}
+
+fn repo_item<'a>(app: &App, r: &'a crate::github::Repo) -> ListItem<'a> {
+    let selected = app.selected.contains(&r.full_name);
+    let mut spans = vec![
+        checkbox(selected),
+        Span::raw(" "),
+        Span::styled(r.full_name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(format!("  ★{}", r.stargazers_count)),
+    ];
+    if r.private {
+        spans.push(Span::styled(" priv", Style::default().fg(Color::Red)));
+    }
+    if r.fork {
+        spans.push(Span::styled(" fork", Style::default().fg(Color::Magenta)));
+    }
+    if r.archived {
+        spans.push(Span::styled(" arch", Style::default().fg(Color::DarkGray)));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+fn gist_item<'a>(app: &App, g: &'a crate::github::Gist) -> ListItem<'a> {
+    let selected = app.selected.contains(&g.id);
+    let files = g.file_count();
+    let mut spans = vec![
+        checkbox(selected),
+        Span::raw(" "),
+        Span::styled(g.display_name(), Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if files > 1 {
+        spans.push(Span::styled(
+            format!("  +{} files", files - 1),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans.push(if g.public {
+        Span::styled(" public", Style::default().fg(Color::Yellow))
+    } else {
+        Span::styled(" secret", Style::default().fg(Color::DarkGray))
+    });
+    ListItem::new(Line::from(spans))
+}
+
 fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
-    let text = match app.current_repo() {
-        Some(r) => {
-            let desc = r.description.clone().unwrap_or_else(|| "(no description)".to_string());
-            format!("{} · updated {} · {}", desc, r.updated_at, r.html_url)
-        }
-        None => "(no repository)".to_string(),
+    let text = match app.view {
+        View::Repos => match app.current_repo() {
+            Some(r) => {
+                let desc = r.description.clone().unwrap_or_else(|| "(no description)".to_string());
+                format!("{} · updated {} · {}", desc, r.updated_at, r.html_url)
+            }
+            None => "(no repository)".to_string(),
+        },
+        View::Gists => match app.current_gist() {
+            Some(g) => {
+                let desc = g
+                    .description
+                    .clone()
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| "(no description)".to_string());
+                let files: Vec<&str> = g.files.keys().map(|s| s.as_str()).collect();
+                format!(
+                    "{} · {} · updated {} · {}",
+                    desc,
+                    files.join(", "),
+                    g.updated_at,
+                    g.html_url
+                )
+            }
+            None => "(no gist)".to_string(),
+        },
     };
     let p = Paragraph::new(text)
         .wrap(Wrap { trim: true })
@@ -127,7 +173,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let help = match app.mode {
         Mode::Browsing => {
-            "↑/↓ j/k move · space select · a clear · / filter · x reset filter · d delete · r refresh · q quit"
+            "↑/↓ j/k move · Tab repos/gists · space select · a clear · / filter · x reset · d delete · r refresh · q quit"
         }
         Mode::Filtering => "type to filter · ↑/↓ move · Backspace · Enter/Esc exit",
         Mode::Confirming => "y confirm DELETE  ·  n / esc cancel",
@@ -148,24 +194,24 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 fn draw_confirm(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 40, f.area());
     f.render_widget(Clear, area);
-    let names: Vec<String> = {
-        let mut v: Vec<String> = app.selected.iter().cloned().collect();
-        v.sort();
-        v
+    let items = app.selected_labeled();
+    let noun = match app.view {
+        View::Repos => "repositories",
+        View::Gists => "gists",
     };
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("Permanently delete {} repositories?", names.len()),
+            format!("Permanently delete {} {}?", items.len(), noun),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
     ];
-    for (i, n) in names.iter().enumerate() {
+    for (i, (_, label)) in items.iter().enumerate() {
         if i >= 10 {
-            lines.push(Line::from(format!("… and {} more", names.len() - 10)));
+            lines.push(Line::from(format!("… and {} more", items.len() - 10)));
             break;
         }
-        lines.push(Line::from(format!("  • {}", n)));
+        lines.push(Line::from(format!("  • {}", label)));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -191,14 +237,14 @@ fn draw_progress(f: &mut Frame, app: &App) {
         "Deleting…",
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     ))];
-    for (name, res) in &app.deletion_results {
+    for (_, label, res) in &app.deletion_results {
         let (sym, color) = match res {
             Ok(()) => ("✓", Color::Green),
             Err(_) => ("✗", Color::Red),
         };
         lines.push(Line::from(vec![
             Span::styled(sym, Style::default().fg(color)),
-            Span::raw(format!(" {}", name)),
+            Span::raw(format!(" {}", label)),
             match res {
                 Ok(()) => Span::raw(""),
                 Err(e) => Span::styled(format!("  ({})", e), Style::default().fg(Color::Red)),
